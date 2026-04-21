@@ -1,0 +1,71 @@
+version: 0.2
+
+# Custom buildspec — lives in the repo, used when customBuildspec=true was
+# passed to RepositorySetup. Mirrors the stack-default contract
+# (probationary v-<sha> tag, then pending-manifest SSM write for the
+# two-phase Inspector2 gate) with a distinctive marker in the log lines
+# so we can tell the repo's version ran rather than the inline default.
+
+phases:
+  pre_build:
+    commands:
+      - 'echo "=== CUSTOM BUILDSPEC FROM REPO === test-image-build custom path"'
+      - export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+      - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com"
+      - aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws
+      - export REPO_URI="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME"
+      - |
+        if [ -z "$BUILD_MODE" ]; then
+          case "$CODEBUILD_WEBHOOK_HEAD_REF" in
+            refs/tags/*)
+              export BUILD_MODE=release
+              export RELEASE_VERSION="${CODEBUILD_WEBHOOK_HEAD_REF#refs/tags/}"
+              ;;
+            *)
+              export BUILD_MODE=latest
+              ;;
+          esac
+        fi
+      - export VULN_GATE="${VULN_GATE:-HIGH}"
+      - |
+        if [ "$BUILD_MODE" = "release" ]; then
+          if [ -z "$RELEASE_VERSION" ]; then
+            echo "RELEASE_VERSION must be set for release builds" >&2
+            exit 1
+          fi
+          export VERSION_TAG="v-$RELEASE_VERSION"
+        else
+          export RELEASE_VERSION=""
+          SHORT_SHA=$(echo "$CODEBUILD_RESOLVED_SOURCE_VERSION" | cut -c1-7)
+          # Append -custom suffix so we can distinguish this build's tag from any
+          # tag the inline default might have pushed on the same commit.
+          export VERSION_TAG="v-${SHORT_SHA}-custom"
+        fi
+      - export PARENT_IMAGE=$(grep -iE '^[[:space:]]*FROM[[:space:]]' Dockerfile | tail -1 | awk '{print $2}')
+      - 'echo "Custom build mode=$BUILD_MODE tag=$VERSION_TAG gate=$VULN_GATE parent=${PARENT_IMAGE:-<none>}"'
+  build:
+    commands:
+      - docker build -t "$IMAGE_REPO_NAME:build" .
+      - docker tag "$IMAGE_REPO_NAME:build" "$REPO_URI:$VERSION_TAG"
+  post_build:
+    commands:
+      - docker push "$REPO_URI:$VERSION_TAG"
+      - export DIGEST=$(aws ecr describe-images --region "$AWS_DEFAULT_REGION" --repository-name "$IMAGE_REPO_NAME" --image-ids imageTag="$VERSION_TAG" --query 'imageDetails[0].imageDigest' --output text)
+      - export DIGEST_HASH="${DIGEST#sha256:}"
+      - 'echo "Custom buildspec pushed $VERSION_TAG (digest=$DIGEST); writing pending manifest."'
+      - |
+        jq -cn \
+          --arg mode "$BUILD_MODE" \
+          --arg rv "${RELEASE_VERSION:-}" \
+          --arg parent "${PARENT_IMAGE:-}" \
+          --argjson depth "${CASCADE_DEPTH:-0}" \
+          --arg gate "$VULN_GATE" \
+          --arg commit "$CODEBUILD_RESOLVED_SOURCE_VERSION" \
+          --arg bid "$CODEBUILD_BUILD_ARN" \
+          --arg repo "https://github.com/HasseJohansen/test-image-build" \
+          --arg tag "$VERSION_TAG" \
+          --arg uri "$REPO_URI" \
+          '{mode:$mode, releaseVersion:$rv, parent:$parent, cascadeDepth:$depth, severityGate:$gate, commit:$commit, buildId:$bid, githubRepo:$repo, versionTag:$tag, repositoryUri:$uri, source:"custom-buildspec"}' \
+          > /tmp/pending.json
+        aws ssm put-parameter --region "$AWS_DEFAULT_REGION" --name "/image-builder/$IMAGE_REPO_NAME/pending/$DIGEST_HASH" --type String --overwrite --value "$(cat /tmp/pending.json)"
+      - 'echo "=== CUSTOM BUILDSPEC DONE === pending manifest written"'
