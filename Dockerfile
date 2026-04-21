@@ -1,5 +1,6 @@
-# Use the official Alpine image as a base
-FROM alpine:latest
+# Use the ECR Public mirror of Alpine to avoid Docker Hub anonymous
+# pull-rate limits on shared CodeBuild egress IPs.
+FROM public.ecr.aws/docker/library/alpine:latest
 
 # Set the working directory inside the container
 WORKDIR /app
